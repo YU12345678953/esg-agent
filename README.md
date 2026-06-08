@@ -204,7 +204,6 @@ ESG_API_BASE=http://localhost:8001 python3 -m streamlit run esg_agent/web_ui.py 
 
 ## 完整使用示例
 
-```bash
 # 1. 克隆项目
 git clone https://github.com/YU12345678953/esg-agent.git
 cd esg-agent
@@ -218,12 +217,11 @@ export MOONSHOT_API_KEY="your-moonshot-key"
 export MINERU_TOKEN="your-mineru-token"
 
 # 4. 启动后端
-cd /path/to/esg-agent
-PORT=8001 python3 -m esg_agent.api
+PORT=8001 python3 -m api
 
 # 5. 新开终端，启动前端
 cd /path/to/esg-agent
-ESG_API_BASE=http://localhost:8001 python3 -m streamlit run esg_agent/web_ui.py --server.port 8510
+ESG_API_BASE=http://localhost:8001 python3 -m streamlit run web_ui.py --server.port 8510
 
-# 6. 浏览器访问 http://localhost:8510
-```
+# 6. 浏览器访问
+http://localhost:8510
