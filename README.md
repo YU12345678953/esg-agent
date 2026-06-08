@@ -203,7 +203,7 @@ ESG_API_BASE=http://localhost:8001 python3 -m streamlit run esg_agent/web_ui.py 
 ---
 
 ## 完整使用示例
-
+```
 # 1. 克隆项目
 git clone https://github.com/YU12345678953/esg-agent.git
 cd esg-agent
@@ -225,3 +225,4 @@ ESG_API_BASE=http://localhost:8001 python3 -m streamlit run web_ui.py --server.p
 
 # 6. 浏览器访问
 http://localhost:8510
+```
