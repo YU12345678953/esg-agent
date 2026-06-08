@@ -1,8 +1,6 @@
-# ESG Agent Demo
-
+# ESG Agent 
 ESG 报告智能生成助手。上传 PDF 文件，自动解析、检索、生成结构化的 ESG 分析报告。
 
-这个版本是一个自包含的网页 demo，不再使用旧的 `graph.py` / `graph_full.py`，也不直接调用根目录下的 step 脚本。
 
 核心流程：
 
