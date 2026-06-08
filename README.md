@@ -1,5 +1,7 @@
 # ESG Agent Demo
 
+ESG 报告智能生成助手。上传 PDF 文件，自动解析、检索、生成结构化的 ESG 分析报告。
+
 这个版本是一个自包含的网页 demo，不再使用旧的 `graph.py` / `graph_full.py`，也不直接调用根目录下的 step 脚本。
 
 核心流程：
@@ -28,34 +30,6 @@ esg_agent/
 ├── prompts/               # 可维护 prompt 模板
 ├── sessions/              # 每个上传任务的文件和结果
 └── requirements.txt
-```
-
-## 启动
-
-先启动 API：
-
-```bash
-cd /Users/dongyu/Desktop/esg
-PORT=8001 python3 -m esg_agent.api
-```
-
-再启动网页：
-
-```bash
-cd /Users/dongyu/Desktop/esg
-ESG_API_BASE=http://localhost:8001 python3 -m streamlit run esg_agent/web_ui.py --server.port 8510
-```
-
-API 默认运行在：
-
-```text
-http://localhost:8001
-```
-
-Streamlit 默认运行在：
-
-```text
-http://localhost:8510
 ```
 
 ## 输出
@@ -158,17 +132,100 @@ MOONSHOT_API_KEY
 MINIMAX_API_KEY
 ```
 
-## 使用说明
-cd /Users/dongyu/Desktop/esg
-python3 -m pip install -r esg_agent/requirements.txt
-后端：
-cd /Users/dongyu/Desktop/esg
+## 快速开始
+
+### 1. 克隆仓库
+
+```bash
+git clone https://github.com/YU12345678953/esg-agent.git
+cd esg-agent
+```
+
+### 2. 安装依赖
+
+```bash
+pip3 install -r requirements.txt
+```
+
+### 3. 配置 API Key
+
+项目需要以下 API Key，请选择至少一种 LLM 提供商：
+
+| 提供商 | 环境变量 | 用途 |
+|--------|----------|------|
+| DeepSeek | `DEEPSEEK_API_KEY` | LLM 推理（文本任务） |
+| Kimi (Moonshot) | `MOONSHOT_API_KEY` | LLM 推理（支持多模态） |
+| MiniMax | `MINIMAX_API_KEY` | LLM 推理（支持多模态） |
+| MinerU | `MINERU_TOKEN` | PDF 解析服务 |
+
+**配置方式一：环境变量（推荐）**
+
+```bash
+# Linux/macOS
+export DEEPSEEK_API_KEY="sk-..."
+export MOONSHOT_API_KEY="sk-..."
+export MINERU_TOKEN="..."
+```
+
+**配置方式二：.env 文件**
+
+在项目根目录创建 `.env` 文件：
+
+```env
+DEEPSEEK_API_KEY=sk-...
+MOONSHOT_API_KEY=sk-...
+MINIMAX_API_KEY=sk-...
+MINERU_TOKEN=...
+```
+
+> 注意：`.env` 文件已加入 `.gitignore`，不会被提交到 Git。
+
+### 4. 启动服务
+
+**启动后端（FastAPI）：**
+
+```bash
+PORT=8001 python3 -m esg_agent.api
+```
+
+后端默认运行在：`http://localhost:8001`
+
+**启动前端（Streamlit）：**
+
+```bash
+ESG_API_BASE=http://localhost:8001 python3 -m streamlit run esg_agent/web_ui.py --server.port 8510
+```
+
+前端默认运行在：`http://localhost:8510`
+
+### 5. 开始使用
+
+浏览器打开 `http://localhost:8510`，上传 PDF 文件开始分析。
+
+---
+
+## 完整使用示例
+
+```bash
+# 1. 克隆项目
+git clone https://github.com/YU12345678953/esg-agent.git
+cd esg-agent
+
+# 2. 安装依赖
+pip3 install -r requirements.txt
+
+# 3. 配置 API Key
+export DEEPSEEK_API_KEY="your-deepseek-key"
+export MOONSHOT_API_KEY="your-moonshot-key"
+export MINERU_TOKEN="your-mineru-token"
+
+# 4. 启动后端
+cd /path/to/esg-agent
 PORT=8001 python3 -m esg_agent.api
 
-前端：
-cd /Users/dongyu/Desktop/esg
+# 5. 新开终端，启动前端
+cd /path/to/esg-agent
 ESG_API_BASE=http://localhost:8001 python3 -m streamlit run esg_agent/web_ui.py --server.port 8510
 
-然后浏览器打开：
-
-http://localhost:8510
+# 6. 浏览器访问 http://localhost:8510
+```
