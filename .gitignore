@@ -1,0 +1,10 @@
+.DS_Store
+__pycache__/
+*.pyc
+sessions/
+*.pdf
+*.docx
+*.pkl
+chroma/
+mineru_output/
+.env

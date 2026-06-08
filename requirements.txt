@@ -1,0 +1,29 @@
+# LangGraph 核心
+langgraph>=0.2.0
+langgraph-checkpoint-sqlite>=2.0.0
+langchain>=0.3.0
+langchain-openai>=0.2.0
+langchain-community>=0.3.0
+langchain-huggingface>=0.1.0
+langchain-text-splitters>=0.3.0
+langchain-mineru>=0.1.0
+chromadb>=0.5.0
+sentence-transformers>=3.0.0
+
+# Web API
+fastapi>=0.115.0
+uvicorn>=0.32.0
+python-multipart>=0.0.12
+
+# Web UI
+streamlit>=1.40.0
+
+# 数据处理
+pandas>=2.2.0
+numpy>=1.26.0
+openpyxl>=3.1.0
+PyMuPDF>=1.24.0
+
+# 工具
+python-dotenv>=1.0.0
+pydantic>=2.9.0
