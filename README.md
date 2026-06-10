@@ -1,8 +1,6 @@
-# ESG Agent Demo
-
+# ESG Agent 
 ESG 报告智能生成助手。上传 PDF 文件，自动解析、检索、生成结构化的 ESG 分析报告。
 
-这个版本是一个自包含的网页 demo，不再使用旧的 `graph.py` / `graph_full.py`，也不直接调用根目录下的 step 脚本。
 
 核心流程：
 
@@ -224,8 +222,7 @@ ESG_API_BASE=http://localhost:8001 python3 -m streamlit run esg_agent/web_ui.py 
 ---
 
 ## 完整使用示例
-
-```bash
+```
 # 1. 克隆项目
 git clone https://github.com/YU12345678953/esg-agent.git
 cd esg-agent
@@ -242,11 +239,12 @@ MINERU_TOKEN=your-mineru-token
 EOF
 
 # 4. 启动后端
-PORT=8001 python3 -m esg_agent.api
+PORT=8001 python3 -m api
 
 # 5. 新开终端，启动前端
-cd /path/to/project-parent
-ESG_API_BASE=http://localhost:8001 python3 -m streamlit run esg_agent/web_ui.py --server.port 8510
+cd /path/to/esg-agent
+ESG_API_BASE=http://localhost:8001 python3 -m streamlit run web_ui.py --server.port 8510
 
-# 6. 浏览器访问 http://localhost:8510
+# 6. 浏览器访问
+http://localhost:8510
 ```
