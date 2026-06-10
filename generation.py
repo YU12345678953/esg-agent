@@ -8,11 +8,14 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict, List
 
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent / ".env")
+
 if not os.getenv("HF_ENDPOINT"):
     os.environ["HF_ENDPOINT"] = os.getenv("EMBEDDING_HF_ENDPOINT", "https://hf-mirror.com")
 
 import pandas as pd
-from dotenv import load_dotenv
 from langchain_community.vectorstores import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_openai import ChatOpenAI
@@ -21,8 +24,6 @@ try:
     from .markdown_sanitizer import sanitize_markdown_for_pypandoc
 except ImportError:
     from markdown_sanitizer import sanitize_markdown_for_pypandoc
-
-load_dotenv()
 
 PROMPT_DIR = Path(__file__).parent / "prompts"
 TOP_K_TITLE = 15
@@ -240,6 +241,13 @@ def get_checker_llm(llm_config: Dict[str, str] | None = None) -> ChatOpenAI:
     if provider not in TEXT_LLM_PROVIDERS:
         raise ValueError(f"普通检查 LLM 不支持 provider: {provider}")
     return make_llm(provider, "check", temperature=0)
+
+
+def get_chat_llm(llm_config: Dict[str, str] | None = None) -> ChatOpenAI:
+    provider = provider_from_config(llm_config, "chat_provider", provider_from_config(llm_config, "selector_provider", "deepseek"))
+    if provider not in TEXT_LLM_PROVIDERS:
+        raise ValueError(f"问答 LLM 不支持 provider: {provider}")
+    return make_llm(provider, "select", temperature=0)
 
 
 def get_vision_checker_llm(llm_config: Dict[str, str] | None = None) -> ChatOpenAI:
@@ -720,6 +728,147 @@ def rag_search_ids(vs: Chroma, section_requirement_text: str, k: int = 20) -> Li
     return ids
 
 
+def tokenize_for_keyword_search(text: str) -> List[str]:
+    text = (text or "").lower()
+    tokens = re.findall(r"[\u4e00-\u9fff]{2,}|[a-zA-Z0-9_%.]+", text)
+    short_terms = []
+    for token in tokens:
+        if re.fullmatch(r"[\u4e00-\u9fff]{4,}", token):
+            short_terms.extend(token[i:i + 2] for i in range(len(token) - 1))
+            short_terms.extend(token[i:i + 3] for i in range(max(0, len(token) - 2)))
+            short_terms.extend(token[i:i + 4] for i in range(max(0, len(token) - 3)))
+    return list(dict.fromkeys(tokens + short_terms))
+
+
+def keyword_search_ids(
+    chunks: List[Any],
+    query: str,
+    k: int = 8,
+) -> List[int]:
+    query_terms = tokenize_for_keyword_search(query)
+    if not query_terms:
+        return []
+
+    docs_terms = []
+    doc_freq: Dict[str, int] = {}
+    doc_lengths = []
+    for chunk in chunks:
+        text = f"{chunk.metadata.get('Header 1', '')}\n{chunk.page_content}"
+        terms = tokenize_for_keyword_search(text)
+        docs_terms.append(terms)
+        doc_lengths.append(len(terms))
+        for term in set(terms):
+            doc_freq[term] = doc_freq.get(term, 0) + 1
+
+    avg_len = sum(doc_lengths) / max(1, len(doc_lengths))
+    total_docs = max(1, len(chunks))
+    k1 = 1.5
+    b = 0.75
+    scores = []
+    query_text = (query or "").lower().strip()
+
+    for index, terms in enumerate(docs_terms):
+        if not terms:
+            continue
+        term_counts: Dict[str, int] = {}
+        for term in terms:
+            term_counts[term] = term_counts.get(term, 0) + 1
+
+        score = 0.0
+        doc_len = max(1, doc_lengths[index])
+        raw_text = f"{chunks[index].metadata.get('Header 1', '')}\n{chunks[index].page_content}".lower()
+
+        if query_text and query_text in raw_text:
+            score += 8.0
+
+        for term in query_terms:
+            freq = term_counts.get(term, 0)
+            if not freq:
+                continue
+            idf = max(0.0, ((total_docs - doc_freq.get(term, 0) + 0.5) / (doc_freq.get(term, 0) + 0.5)))
+            bm25 = idf * (freq * (k1 + 1)) / (freq + k1 * (1 - b + b * doc_len / max(1.0, avg_len)))
+            score += bm25
+            if len(term) >= 4 and term in raw_text:
+                score += 2.5
+            elif len(term) >= 3 and term in raw_text:
+                score += 1.0
+
+        if score > 0:
+            scores.append((index, score))
+
+    scores.sort(key=lambda item: item[1], reverse=True)
+    return [index for index, _score in scores[:k]]
+
+
+def merge_retrieval_ids(*groups: List[int], limit: int = 12) -> List[int]:
+    merged = []
+    for group in groups:
+        for chunk_id in group:
+            if chunk_id not in merged:
+                merged.append(chunk_id)
+            if len(merged) >= limit:
+                return merged
+    return merged
+
+
+def chat_with_report(
+    question: str,
+    chunks: List[Any],
+    vs: Chroma,
+    llm_config: Dict[str, str] | None = None,
+    top_k: int = 12,
+    keyword_k: int = 10,
+) -> Dict[str, Any]:
+    question = (question or "").strip()
+    if not question:
+        raise ValueError("问题不能为空")
+
+    rag_ids = rag_search_ids(vs, question, k=top_k)
+    keyword_ids = keyword_search_ids(chunks, question, k=keyword_k)
+    selected_ids = merge_retrieval_ids(rag_ids, keyword_ids, limit=top_k + keyword_k)
+    evidence_context = build_selected_context(chunks, selected_ids)
+    llm = get_chat_llm(llm_config)
+    prompt = f"""
+你是 ESG 报告问答助手。你需要先判断用户问题的类型，再决定是否使用检索证据。
+
+要求：
+1. 如果用户是在问当前 ESG 报告、PDF 材料、指标、比例、数据、章节、图片、页码或证据，请只根据下面的检索证据回答。
+2. 如果证据中能直接回答，给出简洁、明确的中文答案。
+3. 如果涉及比例、金额、排放量、人数等数字，必须原样引用证据中的数值和单位。
+4. 必须认真读取 Markdown 的 <details> 块、表格、图片说明和图表标题；这些内容也是证据。
+5. 如果用户问的是普通聊天、寒暄、日程、能力说明、与你对话相关的问题，而不是当前报告内容，请自然回复，不要使用检索证据，不要列“来源”。
+6. 如果用户问的是报告内容但证据不足，明确回答“当前材料中没有找到足够证据回答这个问题”，不要编造。
+7. 只有当你实际使用了检索证据回答报告问题时，才在末尾列出引用来源，格式为“来源：CHUNK_ID 95，第 119 页”。必须使用证据中的真实 CHUNK_ID。
+
+用户问题：
+{question}
+
+检索证据：
+{evidence_context or "未检索到相关证据。"}
+""".strip()
+    answer = llm.invoke(prompt).content.strip()
+    used_sources = bool(re.search(r"来源\s*[:：]|CHUNK_ID\s*\d+", answer, flags=re.IGNORECASE))
+    visible_ids = selected_ids if used_sources else []
+    return {
+        "question": question,
+        "answer": answer,
+        "source_chunk_ids": visible_ids,
+        "rag_chunk_ids": rag_ids,
+        "keyword_chunk_ids": keyword_ids,
+        "evidence_pages": unique_evidence_pages(chunks, visible_ids),
+        "source_previews": [
+            {
+                "chunk_id": i,
+                "header": chunks[i].metadata.get("Header 1", ""),
+                "pages": chunks[i].metadata.get("pages") or [chunks[i].metadata.get("page")],
+                "preview": re.sub(r"\s+", " ", chunks[i].page_content).strip()[:500],
+            }
+            for i in visible_ids
+            if isinstance(i, int) and 0 <= i < len(chunks)
+        ],
+    }
+
+
 def build_candidate_context(chunks: List[Any], candidate_ids: List[int]) -> str:
     parts = []
     for i in candidate_ids:
@@ -1157,38 +1306,23 @@ def check_generated_section(
 def unique_evidence_pages(chunks: List[Any], selected_ids: List[int]) -> List[int]:
     pages = []
     for i in selected_ids:
+        if not isinstance(i, int) or i < 0 or i >= len(chunks):
+            continue
         values = chunks[i].metadata.get("pages")
         if values is None:
             values = [chunks[i].metadata.get("page")]
         elif not isinstance(values, list):
             values = [values]
         for page in values:
-            if page is not None and page not in pages:
-                pages.append(int(page))
-    return pages
-
-
-def unique_evidence_sources(chunks: List[Any], selected_ids: List[int]) -> List[Dict[str, Any]]:
-    sources = []
-    for i in selected_ids:
-        metadata = chunks[i].metadata
-        values = metadata.get("pages")
-        if values is None:
-            values = [metadata.get("page")]
-        elif not isinstance(values, list):
-            values = [values]
-        for page in values:
             if page is None:
                 continue
-            source = {
-                "source_pdf_index": metadata.get("source_pdf_index", 0),
-                "source_pdf_name": metadata.get("source_pdf_name") or metadata.get("filename", ""),
-                "source_pdf_path": metadata.get("source_pdf_path") or metadata.get("source", ""),
-                "page": int(page),
-            }
-            if source not in sources:
-                sources.append(source)
-    return sources
+            try:
+                page_no = int(page)
+            except Exception:
+                continue
+            if page_no not in pages:
+                pages.append(page_no)
+    return sorted(pages)
 
 
 def generate_section(
@@ -1277,5 +1411,4 @@ def generate_section(
         "candidate_ids": candidate_ids,
         "selected_chunk_ids": final_ids,
         "evidence_pages": unique_evidence_pages(chunks, final_ids),
-        "evidence_sources": unique_evidence_sources(chunks, final_ids),
     }

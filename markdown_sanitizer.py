@@ -59,6 +59,7 @@ def _unwrap_markdown_code_fence(text: str) -> str:
 def _sanitize_markdown_fragment(text: str) -> str:
     text = HTML_TABLE_PATTERN.sub(lambda match: _convert_html_table(match.group(0)), text)
     text = _convert_centered_html_images(text)
+    text = _remove_orphan_image_attrs(text)
     lines = [line.rstrip() for line in text.split("\n")]
     lines = _normalize_pipe_tables(lines)
     text = "\n".join(lines)
@@ -120,6 +121,20 @@ def _convert_img_tag(img_tag: str) -> str:
     alt = attrs.get("alt", "图片")
     width = _pandoc_width(attrs.get("width", ""))
     return f"![{_escape_image_alt(alt)}]({_escape_image_src(src)}){width}".strip()
+
+
+def _remove_orphan_image_attrs(text: str) -> str:
+    text = re.sub(
+        r"(?m)^(\s*)\{(?:width|height)=[^}\n]+\}\s*(图\s*[:：])",
+        r"\1\2",
+        text,
+    )
+    text = re.sub(
+        r"(?m)^(\s*)\*\s*\{(?:width|height)=[^}\n]+\}\s*(图\s*[:：][^*\n]*)\*?\s*$",
+        r"\1*\2*",
+        text,
+    )
+    return text
 
 
 class _TableParser(HTMLParser):

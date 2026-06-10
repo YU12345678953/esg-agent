@@ -1,10 +1,8 @@
-import json
 import os
 import shutil
 import uuid
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 import fitz
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
@@ -14,17 +12,22 @@ from dotenv import load_dotenv
 
 try:
     from .graph_runner import run_check_section, run_esg_graph, run_regenerate_section
+    from .generation import chat_with_report, load_or_build_vector_store
+    from .pipeline import load_pickle
+    from .session_store import SessionStore, now_text
     from .word_export import convert_markdown_to_word
 except ImportError:
     from graph_runner import run_check_section, run_esg_graph, run_regenerate_section
+    from generation import chat_with_report, load_or_build_vector_store
+    from pipeline import load_pickle
+    from session_store import SessionStore, now_text
     from word_export import convert_markdown_to_word
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
 AGENT_DIR = Path(__file__).resolve().parent
 SESSIONS_DIR = AGENT_DIR / "sessions"
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
-load_dotenv(ROOT_DIR / ".env")
+load_dotenv(AGENT_DIR / ".env")
 
 app = FastAPI(title="ESG Agent API", version="2.0.0")
 app.add_middleware(
@@ -35,62 +38,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-sessions: Dict[str, Dict[str, Any]] = {}
+SESSION_STORE = SessionStore(SESSIONS_DIR)
 TEXT_LLM_PROVIDERS = {"deepseek", "kimi", "minimax"}
 VISION_LLM_PROVIDERS = {"kimi", "minimax"}
 
 
-def now_text() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
 def session_dir(session_id: str) -> Path:
-    return SESSIONS_DIR / session_id
-
-
-def session_json_path(session_id: str) -> Path:
-    return session_dir(session_id) / "session.json"
-
-
-def save_session(session_id: str) -> None:
-    path = session_json_path(session_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(sessions[session_id], f, ensure_ascii=False, indent=2)
+    return SESSION_STORE.session_dir(session_id)
 
 
 def load_session(session_id: str) -> Dict[str, Any]:
-    if session_id in sessions:
-        return sessions[session_id]
-    path = session_json_path(session_id)
-    if not path.exists():
+    try:
+        return SESSION_STORE.load(session_id)
+    except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Session not found")
-    with open(path, "r", encoding="utf-8") as f:
-        sessions[session_id] = json.load(f)
-    return sessions[session_id]
 
 
 def update_session(session_id: str, **updates: Any) -> None:
-    session = load_session(session_id)
-    session.update(updates)
-    session["updated_at"] = now_text()
-    save_session(session_id)
+    SESSION_STORE.update(session_id, **updates)
 
 
 def append_message(session_id: str, role: str, content: str, **extra: Any) -> None:
-    sdir = session_dir(session_id)
-    path = sdir / "messages.json"
-    if path.exists():
-        messages = json.loads(path.read_text(encoding="utf-8"))
-    else:
-        messages = []
-    messages.append({
-        "role": role,
-        "content": content,
-        "created_at": now_text(),
-        **extra,
-    })
-    path.write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
+    SESSION_STORE.append_message(session_id, role, content, **extra)
 
 
 def normalize_provider(provider: str) -> str:
@@ -206,10 +175,51 @@ async def check_section(
     return load_session(session_id)
 
 
+@app.post("/sessions/{session_id}/chat")
+async def chat_session(
+    session_id: str,
+    question: str = Form(...),
+) -> Dict[str, Any]:
+    session = load_session(session_id)
+    if session.get("status") == "building_vector_store":
+        raise HTTPException(status_code=409, detail="检索库正在准备中，请稍后再问")
+    sdir = session_dir(session_id)
+    chunks_path = sdir / "chunks_clean_for_rag.pkl"
+    if not chunks_path.exists():
+        raise HTTPException(status_code=409, detail="检索库尚未准备好，请等待 PDF 解析和向量库构建完成")
+
+    chunks = load_pickle(chunks_path)
+    chroma_dir = sdir / "chroma"
+    vs = load_or_build_vector_store(chunks, chroma_dir)
+    try:
+        result = chat_with_report(
+            question=question,
+            chunks=chunks,
+            vs=vs,
+            llm_config=session.get("llm_config"),
+            top_k=12,
+            keyword_k=10,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"问答失败：{exc}") from exc
+
+    SESSION_STORE.mutate(
+        session_id,
+        lambda current: current.setdefault("chat_history", []).append({
+            "question": result["question"],
+            "answer": result["answer"],
+            "source_chunk_ids": result["source_chunk_ids"],
+            "evidence_pages": result["evidence_pages"],
+            "created_at": now_text(),
+        }),
+    )
+    return result
+
+
 @app.post("/sessions")
 async def create_session(
     background_tasks: BackgroundTasks,
-    pdf: List[UploadFile] = File(...),
+    pdf: UploadFile = File(...),
     excel_path: str = Form("ESG披露框架.xlsx"),
     parse_mode: str = Form("fast"),
     selector_provider: str = Form("deepseek"),
@@ -233,40 +243,24 @@ async def create_session(
     sdir = session_dir(session_id)
     sdir.mkdir(parents=True, exist_ok=True)
 
-    pdf_files = pdf if isinstance(pdf, list) else [pdf]
-    if not pdf_files:
-        raise HTTPException(status_code=400, detail="至少需要上传一个 PDF")
-    pdf_dir = sdir / "source_pdfs"
-    pdf_dir.mkdir(parents=True, exist_ok=True)
-    pdf_paths = []
-    pdf_filenames = []
-    for index, uploaded_pdf in enumerate(pdf_files, start=1):
-        suffix = Path(uploaded_pdf.filename or "").suffix or ".pdf"
-        safe_name = Path(uploaded_pdf.filename or f"source_{index}.pdf").name
-        pdf_path = pdf_dir / f"{index:02d}_{safe_name}"
-        if pdf_path.suffix.lower() != ".pdf":
-            pdf_path = pdf_path.with_suffix(suffix)
-        with open(pdf_path, "wb") as f:
-            shutil.copyfileobj(uploaded_pdf.file, f)
-        pdf_paths.append(str(pdf_path))
-        pdf_filenames.append(uploaded_pdf.filename)
+    pdf_path = sdir / "source.pdf"
+    with open(pdf_path, "wb") as f:
+        shutil.copyfileobj(pdf.file, f)
 
     excel = Path(excel_path)
     if not excel.is_absolute():
-        excel = ROOT_DIR / excel_path
+        excel = AGENT_DIR / excel_path
     if not excel.exists():
         raise HTTPException(status_code=400, detail=f"Excel file not found: {excel}")
 
-    sessions[session_id] = {
+    SESSION_STORE.create(session_id, {
         "session_id": session_id,
         "status": "uploaded",
         "progress_message": "文件已上传，等待后台处理",
         "created_at": now_text(),
         "updated_at": now_text(),
-        "pdf_path": pdf_paths[0],
-        "pdf_paths": pdf_paths,
-        "pdf_filename": pdf_filenames[0],
-        "pdf_filenames": pdf_filenames,
+        "pdf_path": str(pdf_path),
+        "pdf_filename": pdf.filename,
         "excel_path": str(excel),
         "parse_mode": parse_mode,
         "llm_config": llm_config,
@@ -276,9 +270,8 @@ async def create_session(
         "current_section_id": None,
         "current_section_title": None,
         "chunk_count": 0,
-    }
-    save_session(session_id)
-    append_message(session_id, role="user", content=f"上传文件：{'、'.join(pdf_filenames)}", action="upload")
+    })
+    append_message(session_id, role="user", content=f"上传文件：{pdf.filename}", action="upload")
 
     background_tasks.add_task(run_session, session_id)
     return load_session(session_id)
@@ -301,34 +294,24 @@ async def get_section(session_id: str, section_id: str) -> Dict[str, Any]:
 @app.get("/sessions/{session_id}/messages")
 async def get_messages(session_id: str) -> Any:
     load_session(session_id)
-    path = session_dir(session_id) / "messages.json"
-    if not path.exists():
-        return []
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def session_pdf_path(session: Dict[str, Any], pdf_index: int = 0) -> Path:
-    pdf_paths = session.get("pdf_paths") or [session["pdf_path"]]
-    if pdf_index < 0 or pdf_index >= len(pdf_paths):
-        raise HTTPException(status_code=404, detail="PDF not found")
-    return Path(pdf_paths[pdf_index])
+    return SESSION_STORE.get_messages(session_id)
 
 
 @app.get("/sessions/{session_id}/pdf")
-async def get_pdf(session_id: str, pdf_index: int = 0) -> FileResponse:
+async def get_pdf(session_id: str) -> FileResponse:
     session = load_session(session_id)
-    return FileResponse(str(session_pdf_path(session, pdf_index)), media_type="application/pdf")
+    return FileResponse(session["pdf_path"], media_type="application/pdf")
 
 
 @app.get("/sessions/{session_id}/pdf_page/{page_no}.png")
-async def get_pdf_page(session_id: str, page_no: int, scale: float = 2.4, pdf_index: int = 0) -> FileResponse:
+async def get_pdf_page(session_id: str, page_no: int, scale: float = 2.4) -> FileResponse:
     session = load_session(session_id)
-    pdf_path = session_pdf_path(session, pdf_index)
+    pdf_path = Path(session["pdf_path"])
     pages_dir = session_dir(session_id) / "pdf_pages"
     pages_dir.mkdir(exist_ok=True)
     scale = max(1.0, min(float(scale), 4.0))
     scale_key = str(scale).replace(".", "_")
-    image_path = pages_dir / f"pdf_{pdf_index}_page_{page_no}_scale_{scale_key}.png"
+    image_path = pages_dir / f"page_{page_no}_scale_{scale_key}.png"
 
     if not image_path.exists():
         pdf = fitz.open(str(pdf_path))
@@ -371,10 +354,11 @@ async def download_report_docx(session_id: str) -> FileResponse:
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Word 导出失败：{exc}") from exc
 
-    session["word_report_path"] = str(docx_path)
-    session["sanitized_report_path"] = str(sanitized_path)
-    session["updated_at"] = now_text()
-    save_session(session_id)
+    SESSION_STORE.update(
+        session_id,
+        word_report_path=str(docx_path),
+        sanitized_report_path=str(sanitized_path),
+    )
     return FileResponse(
         str(docx_path),
         filename=f"esg_report_{session_id}.docx",

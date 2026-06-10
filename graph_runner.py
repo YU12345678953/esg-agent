@@ -23,7 +23,6 @@ try:
         figure_section,
         format_all_section_overview,
         format_section_requirement_text,
-        generate_section,
         get_figure_llm,
         get_selector_llm,
         get_writer_llm,
@@ -33,7 +32,6 @@ try:
         rerank_material_chunks_for_section,
         revise_whole_report,
         unique_evidence_pages,
-        unique_evidence_sources,
         write_section,
     )
     from .pipeline import load_pickle, run_preprocessing
@@ -51,7 +49,6 @@ except ImportError:
         figure_section,
         format_all_section_overview,
         format_section_requirement_text,
-        generate_section,
         get_figure_llm,
         get_selector_llm,
         get_writer_llm,
@@ -61,7 +58,6 @@ except ImportError:
         rerank_material_chunks_for_section,
         revise_whole_report,
         unique_evidence_pages,
-        unique_evidence_sources,
         write_section,
     )
     from pipeline import load_pickle, run_preprocessing
@@ -70,7 +66,6 @@ except ImportError:
 class ESGGraphState(TypedDict, total=False):
     session_id: str
     pdf_path: str
-    pdf_paths: List[str]
     excel_path: str
     parse_mode: str
     llm_config: Dict[str, str]
@@ -114,7 +109,6 @@ def initial_graph_state(session: Dict[str, Any]) -> ESGGraphState:
     if saved:
         saved["session_id"] = session["session_id"]
         saved["pdf_path"] = session["pdf_path"]
-        saved["pdf_paths"] = session.get("pdf_paths") or [session["pdf_path"]]
         saved["excel_path"] = session["excel_path"]
         saved["parse_mode"] = session["parse_mode"]
         saved["llm_config"] = session["llm_config"]
@@ -129,7 +123,6 @@ def initial_graph_state(session: Dict[str, Any]) -> ESGGraphState:
     return {
         "session_id": session["session_id"],
         "pdf_path": session["pdf_path"],
-        "pdf_paths": session.get("pdf_paths") or [session["pdf_path"]],
         "excel_path": session["excel_path"],
         "parse_mode": session["parse_mode"],
         "llm_config": session["llm_config"],
@@ -146,29 +139,99 @@ def initial_graph_state(session: Dict[str, Any]) -> ESGGraphState:
     }
 
 
-def sync_session_from_state(
+def graph_state_to_session_projection(
     state: ESGGraphState,
-    update_session: Callable[..., None],
     **updates: Any,
-) -> None:
+) -> Dict[str, Any]:
+    """Build the UI-facing session snapshot from the workflow state."""
     sections = state.get("sections", [])
-    update_session(
-        state["session_id"],
-        sections=sections,
-        completed_sections=[
+    projection = {
+        "sections": sections,
+        "completed_sections": [
             section["section_id"]
             for section in sections
             if section.get("status") == "generated"
         ],
-        chunk_count=state.get("chunk_count", 0),
-        timings=state.get("timings", []),
-        full_report_path=state.get("full_report_path"),
-        **updates,
+        "chunk_count": state.get("chunk_count", 0),
+        "timings": state.get("timings", []),
+        "full_report_path": state.get("full_report_path"),
+    }
+    projection.update(updates)
+    return projection
+
+
+def project_graph_state_to_session(
+    state: ESGGraphState,
+    update_session: Callable[..., None],
+    **updates: Any,
+) -> None:
+    """Project LangGraph's internal state into session.json for the UI."""
+    update_session(
+        state["session_id"],
+        **graph_state_to_session_projection(state, **updates),
     )
 
 
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def build_section_version(
+    section_result: Dict[str, Any],
+    version_number: int,
+    action: str,
+) -> Dict[str, Any]:
+    return {
+        "version": version_number,
+        "action": action,
+        "created_at": now_text(),
+        "content": section_result.get("content", ""),
+        "selected_chunk_ids": section_result.get("selected_chunk_ids", []),
+        "evidence_pages": section_result.get("evidence_pages", []),
+        "title_ids": section_result.get("title_ids", []),
+        "rag_ids": section_result.get("rag_ids", []),
+        "candidate_ids": section_result.get("candidate_ids", []),
+    }
+
+
+def ensure_section_versions(section: Dict[str, Any]) -> List[Dict[str, Any]]:
+    versions = section.get("versions")
+    if isinstance(versions, list) and versions:
+        return versions
+
+    if section.get("content"):
+        return [build_section_version(section, 1, section.get("version_action", "generate"))]
+    return []
+
+
+def upsert_section_result(
+    sections: List[Dict[str, Any]],
+    section_result: Dict[str, Any],
+    action: str = "generate",
+) -> List[Dict[str, Any]]:
+    by_id = {
+        section.get("section_id"): dict(section)
+        for section in sections
+    }
+    existing = by_id.get(section_result["section_id"])
+    versions = ensure_section_versions(existing) if existing else []
+    next_version = len(versions) + 1
+    versions.append(build_section_version(section_result, next_version, action))
+
+    merged = dict(existing or {})
+    merged.update(section_result)
+    merged["versions"] = versions
+    merged["active_version"] = next_version
+    merged["version_action"] = action
+    merged["versioned_at"] = now_text()
+    by_id[section_result["section_id"]] = merged
+
+    ordered = []
+    for section_group in SECTION_GROUPS:
+        section = by_id.get(section_group["section_id"])
+        if section:
+            ordered.append(section)
+    return ordered
 
 
 def append_timing(
@@ -191,6 +254,7 @@ def build_esg_graph(
     update_session: Callable[..., None],
     append_message: Callable[..., None],
     checkpointer: SqliteSaver | None = None,
+    entry_point: str = "preprocess",
 ):
     graph = StateGraph(ESGGraphState)
 
@@ -210,7 +274,7 @@ def build_esg_graph(
                 time.perf_counter() - started,
                 detail="skip_existing_chunks",
             )
-            sync_session_from_state(
+            project_graph_state_to_session(
                 state,
                 update_session,
                 status="building_vector_store",
@@ -219,7 +283,7 @@ def build_esg_graph(
             save_graph_state(state)
             return state
 
-        sync_session_from_state(
+        project_graph_state_to_session(
             state,
             update_session,
             status="parsing_pdf",
@@ -230,7 +294,7 @@ def build_esg_graph(
             update_session(state["session_id"], progress_message=message)
 
         chunks = run_preprocessing(
-            [Path(path) for path in state.get("pdf_paths") or [state["pdf_path"]]],
+            Path(state["pdf_path"]),
             output_dir,
             status_callback=status_callback,
             parse_mode=state["parse_mode"],
@@ -245,7 +309,7 @@ def build_esg_graph(
         chunks = load_pickle(Path(state["chunks_path"]))
         state["chunk_count"] = len(chunks)
         state["chroma_dir"] = str(Path(state["output_dir"]) / "chroma")
-        sync_session_from_state(
+        project_graph_state_to_session(
             state,
             update_session,
             status="building_vector_store",
@@ -306,7 +370,18 @@ def build_esg_graph(
 
     def start_section_node(state: ESGGraphState) -> ESGGraphState:
         started = time.perf_counter()
-        current_index = int(state.get("current_section_index", 0))
+        if state.get("run_mode") == "regenerate_section":
+            target_section_id = state.get("target_section_id")
+            current_index = next(
+                (
+                    index for index, group in enumerate(SECTION_GROUPS)
+                    if group["section_id"] == target_section_id
+                ),
+                int(state.get("current_section_index", 0)),
+            )
+            state["current_section_index"] = current_index
+        else:
+            current_index = int(state.get("current_section_index", 0))
         sections = state.get("sections") or []
 
         if current_index >= len(SECTION_GROUPS):
@@ -319,7 +394,10 @@ def build_esg_graph(
             for section in sections
             if section.get("status") == "generated"
         }
-        if section_group["section_id"] in existing_by_id:
+        if (
+            state.get("run_mode") != "regenerate_section"
+            and section_group["section_id"] in existing_by_id
+        ):
             state["current_section_index"] = current_index + 1
             append_timing(
                 state,
@@ -332,13 +410,17 @@ def build_esg_graph(
             save_graph_state(state)
             return state
 
-        sync_session_from_state(
+        project_graph_state_to_session(
             state,
             update_session,
             status="generating",
             current_section_id=section_group["section_id"],
             current_section_title=section_group["title"],
-            progress_message=f"正在生成 {section_group['title']} ({current_index + 1}/{len(SECTION_GROUPS)})",
+            progress_message=(
+                f"正在重新生成 {section_group['title']}"
+                if state.get("run_mode") == "regenerate_section"
+                else f"正在生成 {section_group['title']} ({current_index + 1}/{len(SECTION_GROUPS)})"
+            ),
         )
 
         req_map = {
@@ -534,6 +616,7 @@ def build_esg_graph(
     def save_section_node(state: ESGGraphState) -> ESGGraphState:
         started = time.perf_counter()
         work = state["current_section_work"]
+        action = "regenerate" if state.get("run_mode") == "regenerate_section" else "generate"
         update_session(
             state["session_id"],
             progress_message=f"正在保存 {work['section_group']['title']} 章节",
@@ -553,19 +636,16 @@ def build_esg_graph(
             "candidate_ids": work.get("candidate_ids", []),
             "selected_chunk_ids": final_ids,
             "evidence_pages": unique_evidence_pages(chunks, final_ids),
-            "evidence_sources": unique_evidence_sources(chunks, final_ids),
         }
         section_path = Path(state["output_dir"]) / f"{section_group['section_id']}.md"
         section_path.write_text(content, encoding="utf-8")
 
         sections = state.get("sections") or []
-        sections = [
-            section for section in sections
-            if section.get("section_id") != section_result["section_id"]
-        ]
-        sections.append(section_result)
-        state["sections"] = sections
-        state["current_section_index"] = int(work.get("section_index", 0)) + 1
+        state["sections"] = upsert_section_result(sections, section_result, action=action)
+        if state.get("run_mode") == "regenerate_section":
+            state["current_section_index"] = int(state.get("resume_section_index", len(state.get("sections", []))))
+        else:
+            state["current_section_index"] = int(work.get("section_index", 0)) + 1
 
         if section_result.get("content"):
             append_message(
@@ -573,8 +653,8 @@ def build_esg_graph(
                 role="assistant",
                 content=section_result["content"],
                 section_id=section_result["section_id"],
-                action="generate",
-        )
+                action=action,
+            )
 
         append_timing(
             state,
@@ -590,15 +670,37 @@ def build_esg_graph(
             section_id=section_group["section_id"],
             section_title=section_group["title"],
         )
-        sync_session_from_state(
+        project_graph_state_to_session(
             state,
             update_session,
             status="generating",
             current_section_id=section_group["section_id"],
             current_section_title=section_group["title"],
-            progress_message=f"{section_group['title']} 生成完成",
+            progress_message=(
+                f"{section_group['title']} 重新生成完成"
+                if action == "regenerate"
+                else f"{section_group['title']} 生成完成"
+            ),
         )
         state["current_section_work"] = {}
+        save_graph_state(state)
+        return state
+
+    def finish_regenerate_node(state: ESGGraphState) -> ESGGraphState:
+        started = time.perf_counter()
+        rebuild_full_report(state)
+        append_timing(state, "finish_regenerate", time.perf_counter() - started)
+        project_graph_state_to_session(
+            state,
+            update_session,
+            status="completed" if len(state.get("sections", [])) >= len(SECTION_GROUPS) else "generating",
+            current_section_id=None,
+            current_section_title=None,
+            progress_message="章节重新生成完成，已保留历史版本",
+        )
+        state.pop("run_mode", None)
+        state.pop("target_section_id", None)
+        state.pop("resume_section_index", None)
         save_graph_state(state)
         return state
 
@@ -642,7 +744,7 @@ def build_esg_graph(
         full_report_path.write_text(full_report, encoding="utf-8")
         state["full_report_path"] = str(full_report_path)
         append_timing(state, "finalize", time.perf_counter() - started)
-        sync_session_from_state(
+        project_graph_state_to_session(
             state,
             update_session,
             status="completed",
@@ -654,12 +756,16 @@ def build_esg_graph(
         return state
 
     def should_continue_sections(state: ESGGraphState) -> str:
+        if state.get("run_mode") == "regenerate_section":
+            return "finish_regenerate"
         if int(state.get("current_section_index", 0)) >= len(SECTION_GROUPS):
             return "finalize"
         return "start_section"
 
     def should_continue_after_start(state: ESGGraphState) -> str:
         work = state.get("current_section_work") or {}
+        if state.get("run_mode") == "regenerate_section" and not work:
+            return "finish_regenerate"
         if int(state.get("current_section_index", 0)) >= len(SECTION_GROUPS) and not work:
             return "finalize"
         if not work:
@@ -678,9 +784,12 @@ def build_esg_graph(
     graph.add_node("insert_figures", insert_figures_node)
     graph.add_node("sanitize_markdown", sanitize_markdown_node)
     graph.add_node("save_section", save_section_node)
+    graph.add_node("finish_regenerate", finish_regenerate_node)
     graph.add_node("finalize", finalize_node)
 
-    graph.set_entry_point("preprocess")
+    if entry_point not in {"preprocess", "start_section"}:
+        raise ValueError(f"Unsupported graph entry_point: {entry_point}")
+    graph.set_entry_point(entry_point)
     graph.add_edge("preprocess", "build_vector_store")
     graph.add_edge("build_vector_store", "load_requirements")
     graph.add_edge("load_requirements", "assign_chunks_to_sections")
@@ -690,6 +799,7 @@ def build_esg_graph(
         {
             "start_section": "start_section",
             "finalize": "finalize",
+            "finish_regenerate": "finish_regenerate",
         },
     )
     graph.add_conditional_edges(
@@ -699,6 +809,7 @@ def build_esg_graph(
             "rag_search": "rag_search",
             "start_section": "start_section",
             "finalize": "finalize",
+            "finish_regenerate": "finish_regenerate",
         },
     )
     graph.add_edge("rag_search", "build_candidate_context")
@@ -713,8 +824,10 @@ def build_esg_graph(
         {
             "start_section": "start_section",
             "finalize": "finalize",
+            "finish_regenerate": "finish_regenerate",
         },
     )
+    graph.add_edge("finish_regenerate", END)
     graph.add_edge("finalize", END)
     return graph.compile(checkpointer=checkpointer)
 
@@ -746,7 +859,7 @@ def run_esg_graph(
     except Exception as exc:
         snapshot = graph.get_state(config)
         latest_state = snapshot.values or load_graph_state(output_dir) or state
-        sync_session_from_state(
+        project_graph_state_to_session(
             latest_state,
             update_session,
             status="failed",
@@ -823,15 +936,18 @@ def run_regenerate_section(
     config = {
         "recursion_limit": 80,
         "configurable": {
-            "thread_id": session["session_id"],
+            "thread_id": f"{session['session_id']}:regenerate:{section_id}:{int(time.time() * 1000)}",
         },
     }
-    graph = build_esg_graph(update_session, append_message, checkpointer=checkpointer)
+    graph = build_esg_graph(
+        update_session,
+        append_message,
+        checkpointer=checkpointer,
+        entry_point="start_section",
+    )
 
     try:
-        started = time.perf_counter()
-        snapshot = graph.get_state(config)
-        state = snapshot.values or initial_graph_state(session)
+        state = load_graph_state(output_dir) or initial_graph_state(session)
         state["session_id"] = session["session_id"]
         state["pdf_path"] = session["pdf_path"]
         state["excel_path"] = session["excel_path"]
@@ -848,7 +964,27 @@ def run_regenerate_section(
         if section_group is None:
             raise ValueError(f"Unknown section_id: {section_id}")
 
-        sync_session_from_state(
+        section_index = next(
+            index for index, group in enumerate(SECTION_GROUPS)
+            if group["section_id"] == section_id
+        )
+        chunks = load_pickle(Path(state["chunks_path"]))
+        state["chunk_count"] = len(chunks)
+        state["requirements"] = state.get("requirements") or load_requirements_from_excel(Path(state["excel_path"]))
+
+        section_map_path = output_dir / "section_chunk_map.json"
+        if section_map_path.exists() and not state.get("section_chunk_map"):
+            assignment_result = json.loads(section_map_path.read_text(encoding="utf-8"))
+            state["section_chunk_map"] = assignment_result.get("section_chunk_map", {})
+            state["section_chunk_votes"] = assignment_result.get("section_chunk_votes", {})
+
+        state["run_mode"] = "regenerate_section"
+        state["target_section_id"] = section_id
+        state["resume_section_index"] = int(state.get("current_section_index", len(state.get("sections", []))))
+        state["current_section_index"] = section_index
+        state["current_section_work"] = {}
+
+        project_graph_state_to_session(
             state,
             update_session,
             status="generating",
@@ -857,59 +993,21 @@ def run_regenerate_section(
             progress_message=f"正在重新生成 {section_group['title']}",
         )
 
-        chunks = load_pickle(Path(state["chunks_path"]))
-        state["chunk_count"] = len(chunks)
-        vs = load_or_build_vector_store(chunks, Path(state["chroma_dir"]))
-        requirements = state.get("requirements") or load_requirements_from_excel(Path(state["excel_path"]))
-        state["requirements"] = requirements
-        req_map = {
-            req["指引条目"].strip(): req
-            for req in requirements
-        }
-        chunk_catalogue = build_chunk_catalogue(chunks)
-        section_result = generate_section(
-            chunks=chunks,
-            vs=vs,
-            req_map=req_map,
-            section_group=section_group,
-            output_dir=output_dir,
-            chunk_catalogue=chunk_catalogue,
-            llm_config=state["llm_config"],
-        )
-
-        state["sections"] = replace_section_result(
-            state.get("sections", []),
-            section_result,
-        )
-        append_timing(
-            state,
-            "regenerate_section",
-            time.perf_counter() - started,
-            section_id=section_group["section_id"],
-            section_title=section_group["title"],
-        )
-        rebuild_full_report(state)
         save_graph_state(state)
-        graph.update_state(config, state)
-
-        append_message(
-            session["session_id"],
-            role="assistant",
-            content=section_result.get("content", ""),
-            section_id=section_result["section_id"],
-            action="regenerate",
-        )
-        sync_session_from_state(
-            state,
-            update_session,
-            status="completed" if len(state.get("sections", [])) >= len(SECTION_GROUPS) else "generating",
-            current_section_id=None,
-            current_section_title=None,
-            progress_message=f"{section_group['title']} 已重新生成",
+        graph.invoke(state, config=config)
+        latest_state = load_graph_state(output_dir) or graph.get_state(config).values or state
+        graph.update_state(
+            {
+                "recursion_limit": 80,
+                "configurable": {
+                    "thread_id": session["session_id"],
+                },
+            },
+            latest_state,
         )
     except Exception as exc:
         latest_state = graph.get_state(config).values or load_graph_state(output_dir) or initial_graph_state(session)
-        sync_session_from_state(
+        project_graph_state_to_session(
             latest_state,
             update_session,
             status="failed",
@@ -947,7 +1045,7 @@ def run_check_section(
     try:
         started = time.perf_counter()
         snapshot = graph.get_state(config)
-        state = snapshot.values or initial_graph_state(session)
+        state = load_graph_state(output_dir) or snapshot.values or initial_graph_state(session)
         state["session_id"] = session["session_id"]
         state["pdf_path"] = session["pdf_path"]
         state["excel_path"] = session["excel_path"]
@@ -971,7 +1069,7 @@ def run_check_section(
         if section_result is None or section_result.get("status") != "generated":
             raise ValueError(f"Section has not been generated: {section_id}")
 
-        sync_session_from_state(
+        project_graph_state_to_session(
             state,
             update_session,
             status="checking",
@@ -1026,7 +1124,7 @@ def run_check_section(
             action="check",
             check_mode=check_mode,
         )
-        sync_session_from_state(
+        project_graph_state_to_session(
             state,
             update_session,
             status="completed" if len(state.get("sections", [])) >= len(SECTION_GROUPS) else "generating",
@@ -1036,7 +1134,7 @@ def run_check_section(
         )
     except Exception as exc:
         latest_state = graph.get_state(config).values or load_graph_state(output_dir) or initial_graph_state(session)
-        sync_session_from_state(
+        project_graph_state_to_session(
             latest_state,
             update_session,
             status="failed",

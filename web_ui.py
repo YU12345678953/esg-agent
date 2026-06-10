@@ -47,6 +47,8 @@ if "selected_page" not in st.session_state:
     st.session_state.selected_page = None
 if "auto_refresh" not in st.session_state:
     st.session_state.auto_refresh = True
+if "chat_messages" not in st.session_state:
+    st.session_state.chat_messages = []
 
 SCROLL_HEIGHT = 820
 
@@ -71,6 +73,17 @@ def local_image_to_data_url(raw_path: str) -> str | None:
 
 
 def render_markdown_with_local_images(markdown_text: str) -> str:
+    markdown_text = re.sub(
+        r"(?m)^(\s*)\{(?:width|height)=[^}\n]+\}\s*(图\s*[:：])",
+        r"\1\2",
+        markdown_text,
+    )
+    markdown_text = re.sub(
+        r"(?m)^(\s*)\*\s*\{(?:width|height)=[^}\n]+\}\s*(图\s*[:：][^*\n]*)\*?\s*$",
+        r"\1*\2*",
+        markdown_text,
+    )
+
     def replace_md_image(match):
         alt = match.group(1)
         raw_path = match.group(2)
@@ -89,7 +102,7 @@ def render_markdown_with_local_images(markdown_text: str) -> str:
         return f'<img{before}src="{data_url}"{after} class="report-image">'
 
     markdown_text = re.sub(
-        r"!\[([^\]]*)\]\((/[^)]+)\)",
+        r"!\[([^\]]*)\]\((/[^)]+)\)(?:\{[^}\n]*\})?",
         replace_md_image,
         markdown_text,
     )
@@ -100,6 +113,22 @@ def render_markdown_with_local_images(markdown_text: str) -> str:
         flags=re.IGNORECASE,
     )
     return markdown_text
+
+
+def get_selected_section_version(section: dict) -> dict:
+    versions = section.get("versions") or []
+    if not versions:
+        return section
+
+    active_version = section.get("active_version") or versions[-1].get("version")
+    selected_version = st.session_state.get(
+        f"selected_version_{section['section_id']}",
+        active_version,
+    )
+    for version in versions:
+        if version.get("version") == selected_version:
+            return version
+    return versions[-1]
 
 
 def api_get(path):
@@ -123,7 +152,7 @@ def load_session():
 
 with st.sidebar:
     st.subheader("文件")
-    uploaded_files = st.file_uploader("上传 PDF", type=["pdf"], accept_multiple_files=True)
+    uploaded_file = st.file_uploader("上传 PDF", type=["pdf"]) #现在是只允许pdf
     excel_path = st.text_input("披露框架 Excel", value="ESG披露框架.xlsx")
     parse_mode_label = st.selectbox(
         "解析模式",
@@ -162,19 +191,15 @@ with st.sidebar:
             index=0,
         )
 
-    if st.button("开始生成", type="primary", use_container_width=True, disabled=not uploaded_files):
+    if st.button("开始生成", type="primary", use_container_width=True, disabled=uploaded_file is None):
         try:
-            files = [
-                (
-                    "pdf",
-                    (
-                        uploaded_file.name,
-                        uploaded_file.getvalue(),
-                        "application/pdf",
-                    ),
+            files = {
+                "pdf": (
+                    uploaded_file.name,
+                    uploaded_file.getvalue(),
+                    "application/pdf",
                 )
-                for uploaded_file in uploaded_files
-            ]
+            }
             data = {
                 "excel_path": excel_path,
                 "parse_mode": parse_mode,
@@ -329,9 +354,33 @@ with left:
             except Exception as exc:
                 st.error(f"视觉检查失败：{exc}")
 
+        versions = selected_section.get("versions") or []
+        if versions:
+            version_numbers = [version.get("version") for version in versions]
+            active_version = selected_section.get("active_version") or version_numbers[-1]
+            default_index = version_numbers.index(active_version) if active_version in version_numbers else len(version_numbers) - 1
+            version_key = f"selected_version_{selected_section['section_id']}"
+            if st.session_state.get(version_key) not in version_numbers:
+                st.session_state[version_key] = active_version
+            selected_version_number = st.selectbox(
+                "查看版本",
+                options=version_numbers,
+                index=default_index,
+                format_func=lambda version: f"版本 {version}",
+                key=version_key,
+            )
+            selected_version = get_selected_section_version(selected_section)
+            st.caption(
+                f"当前查看：版本 {selected_version_number} | "
+                f"{selected_version.get('action', 'generate')} | "
+                f"{selected_version.get('created_at', '')}"
+            )
+        else:
+            selected_version = selected_section
+
         with st.container(height=SCROLL_HEIGHT):
             st.markdown(
-                render_markdown_with_local_images(selected_section.get("content", "")),
+                render_markdown_with_local_images(selected_version.get("content", "")),
                 unsafe_allow_html=True,
             )
 
@@ -378,50 +427,67 @@ with right:
     if not selected_section:
         st.info("生成章节后会在这里显示证据页。")
     else:
-        evidence_sources = selected_section.get("evidence_sources") or []
-        evidence_pages = sorted(dict.fromkeys(selected_section.get("evidence_pages") or []))
-        selected_ids = selected_section.get("selected_chunk_ids") or []
+        selected_version = get_selected_section_version(selected_section)
+        evidence_pages = sorted(dict.fromkeys(selected_version.get("evidence_pages") or []))
+        selected_ids = selected_version.get("selected_chunk_ids") or []
 
         st.caption(f"证据 chunk：{selected_ids}")
 
-        if not evidence_sources and not evidence_pages:
+        if not evidence_pages:
             st.info("该章节暂无可定位证据页。")
         else:
-            if evidence_sources:
-                st.caption("证据页按来源 PDF 和页码排列")
-                display_sources = sorted(
-                    evidence_sources,
-                    key=lambda item: (
-                        int(item.get("source_pdf_index") or 0),
-                        int(item.get("page") or 0),
-                    ),
-                )
-            else:
-                st.caption("证据页按页码从小到大排列")
-                display_sources = [
-                    {
-                        "source_pdf_index": 0,
-                        "source_pdf_name": session.get("pdf_filename", "PDF"),
-                        "page": page_no,
-                    }
-                    for page_no in evidence_pages
-                ]
+            st.caption("证据页按页码从小到大排列")
             with st.container(height=SCROLL_HEIGHT):
-                for source in display_sources:
-                    page_no = int(source.get("page") or 0)
-                    pdf_index = int(source.get("source_pdf_index") or 0)
-                    pdf_name = source.get("source_pdf_name") or session.get("pdf_filename", "PDF")
+                for page_no in evidence_pages:
                     image_url = (
                         f"{API_BASE}/sessions/{session['session_id']}/pdf_page/{page_no}.png"
-                        f"?scale=2.8&pdf_index={pdf_index}"
+                        "?scale=2.8"
                     )
-                    st.image(image_url, caption=f"{pdf_name} 第 {page_no} 页", use_container_width=True)
+                    st.image(image_url, caption=f"PDF 第 {page_no} 页", use_container_width=True)
 
-            first_source = display_sources[0]
-            first_page = int(first_source.get("page") or 1)
-            first_pdf_index = int(first_source.get("source_pdf_index") or 0)
-            pdf_url = f"{API_BASE}/sessions/{session['session_id']}/pdf?pdf_index={first_pdf_index}#page={first_page}"
+            first_page = evidence_pages[0]
+            pdf_url = f"{API_BASE}/sessions/{session['session_id']}/pdf#page={first_page}"
             st.link_button("打开原 PDF", pdf_url, use_container_width=True)
+
+    with st.expander("问报告", expanded=True):
+       
+        for message in st.session_state.chat_messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+                pages = message.get("evidence_pages") or []
+                chunks = message.get("source_chunk_ids") or []
+                if message["role"] == "assistant" and (pages or chunks):
+                    st.caption(f"证据页：{pages or '无'} | chunk：{chunks or '无'}")
+
+        question = st.chat_input("问一个关于这份报告的问题，例如：女性员工的比例是多少？")
+        if question:
+            st.session_state.chat_messages.append({"role": "user", "content": question})
+            try:
+                response = HTTP.post(
+                    f"{API_BASE}/sessions/{session['session_id']}/chat",
+                    data={"question": question},
+                    timeout=120,
+                )
+                if response.status_code >= 400:
+                    try:
+                        detail = response.json().get("detail", response.text)
+                    except Exception:
+                        detail = response.text
+                    raise RuntimeError(detail)
+                result = response.json()
+                st.session_state.chat_messages.append({
+                    "role": "assistant",
+                    "content": result.get("answer", ""),
+                    "evidence_pages": result.get("evidence_pages", []),
+                    "source_chunk_ids": result.get("source_chunk_ids", []),
+                })
+                st.rerun()
+            except Exception as exc:
+                st.session_state.chat_messages.append({
+                    "role": "assistant",
+                    "content": f"问答失败：{exc}",
+                })
+                st.rerun()
 
 if status in {"uploaded", "queued", "parsing_pdf", "building_vector_store", "generating", "checking"} and st.session_state.auto_refresh:
     time.sleep(4)

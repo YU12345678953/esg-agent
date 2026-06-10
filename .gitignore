@@ -8,3 +8,4 @@ sessions/
 chroma/
 mineru_output/
 .env
+*.xlsx

@@ -27,6 +27,8 @@ esg_agent/
 ├── graph_runner.py        # LangGraph 流程编排和中断续跑
 ├── pipeline.py            # PDF 解析、清洗、chunk、页码映射
 ├── generation.py          # ESG section 生成逻辑
+├── ESG披露框架.xlsx        # 默认披露框架
+├── .env                   # 本地 API Key 配置（不要发给别人）
 ├── prompts/               # 可维护 prompt 模板
 ├── sessions/              # 每个上传任务的文件和结果
 └── requirements.txt
@@ -134,17 +136,24 @@ MINIMAX_API_KEY
 
 ## 快速开始
 
-### 1. 克隆仓库
+### 1. 获取项目
 
 ```bash
 git clone https://github.com/YU12345678953/esg-agent.git
 cd esg-agent
 ```
 
+如果你拿到的是别人发来的 `esg_agent` 文件夹，请进入它的上级目录。例如：
+
+```bash
+cd /path/to/project-parent
+ls esg_agent
+```
+
 ### 2. 安装依赖
 
 ```bash
-pip3 install -r requirements.txt
+pip3 install -r esg_agent/requirements.txt
 ```
 
 ### 3. 配置 API Key
@@ -169,7 +178,7 @@ export MINERU_TOKEN="..."
 
 **配置方式二：.env 文件**
 
-在项目根目录创建 `.env` 文件：
+在 `esg_agent/` 目录内创建 `.env` 文件：
 
 ```env
 DEEPSEEK_API_KEY=sk-...
@@ -178,13 +187,22 @@ MINIMAX_API_KEY=sk-...
 MINERU_TOKEN=...
 ```
 
-> 注意：`.env` 文件已加入 `.gitignore`，不会被提交到 Git。
+> 注意：`.env` 包含密钥，不要发给别人。可以提供 `.env.example` 让使用者自行填写。
+
+默认披露框架文件也放在 `esg_agent/` 目录内：
+
+```text
+esg_agent/ESG披露框架.xlsx
+```
+
+网页里的“披露框架 Excel”默认填写 `ESG披露框架.xlsx`，后端会从 `esg_agent/` 目录查找该文件。
 
 ### 4. 启动服务
 
 **启动后端（FastAPI）：**
 
 ```bash
+# 必须在 esg_agent 的上级目录执行
 PORT=8001 python3 -m esg_agent.api
 ```
 
@@ -193,6 +211,7 @@ PORT=8001 python3 -m esg_agent.api
 **启动前端（Streamlit）：**
 
 ```bash
+# 必须在 esg_agent 的上级目录执行
 ESG_API_BASE=http://localhost:8001 python3 -m streamlit run esg_agent/web_ui.py --server.port 8510
 ```
 
@@ -212,19 +231,21 @@ git clone https://github.com/YU12345678953/esg-agent.git
 cd esg-agent
 
 # 2. 安装依赖
-pip3 install -r requirements.txt
+pip3 install -r esg_agent/requirements.txt
 
 # 3. 配置 API Key
-export DEEPSEEK_API_KEY="your-deepseek-key"
-export MOONSHOT_API_KEY="your-moonshot-key"
-export MINERU_TOKEN="your-mineru-token"
+cat > esg_agent/.env <<'EOF'
+DEEPSEEK_API_KEY=your-deepseek-key
+MOONSHOT_API_KEY=your-moonshot-key
+MINIMAX_API_KEY=your-minimax-key
+MINERU_TOKEN=your-mineru-token
+EOF
 
 # 4. 启动后端
-cd /path/to/esg-agent
 PORT=8001 python3 -m esg_agent.api
 
 # 5. 新开终端，启动前端
-cd /path/to/esg-agent
+cd /path/to/project-parent
 ESG_API_BASE=http://localhost:8001 python3 -m streamlit run esg_agent/web_ui.py --server.port 8510
 
 # 6. 浏览器访问 http://localhost:8510
